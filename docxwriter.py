@@ -1031,6 +1031,8 @@ class DocxTranslator(nodes.NodeVisitor):
 
     def get_image_scaled_width_height(self, node, filename):
         dpi = (72, 72)
+        from pprint import pprint as pp
+        pp(filename)
         if PIL is not None and filename in self.image_dict:
             filename, destination = self.image_dict[filename]
             imageobj = PIL.Image.open(filename, 'r')
@@ -1597,14 +1599,14 @@ class DocxTranslator(nodes.NodeVisitor):
         pass
 
     def visit_graphviz(self, node):
-        pass
-        # dprint()
-        # fname, filename = graphviz.render_dot(
-        #     self, node['code'], node['options'], 'png')
-        # self.flush_state()
-        # width, height = self.get_image_scaled_width_height(node, filename)
-        # self.docx.picture(filename, '', width, height)
-        # raise nodes.SkipNode
+        dprint()
+        fname, filename = graphviz.render_dot(
+            self, node['code'], node['options'], 'png')
+        self.flush_state()
+        self.image_dict[filename]=(filename,filename,)
+        width, height = self.get_image_scaled_width_height(node, filename)
+        self.docx.picture(filename, '', width, height)
+        raise nodes.SkipNode
 
     def unknown_visit(self, node):
         dprint()
