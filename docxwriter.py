@@ -13,7 +13,7 @@
 
 import re
 
-from docutils import nodes, writers
+from docutils import nodes, writers, utils
 
 from sphinx import addnodes
 from sphinx import highlighting
@@ -22,20 +22,25 @@ from sphinx.locale import admonitionlabels, versionlabels, _
 from sphinx.ext import graphviz
 
 import docx
+import urllib2
 import sys
 import os
 import zipfile
 import tempfile
 from lxml import etree
-from highlight import *
-
+from docxhighlight import *
 
 #
 # Is the PIL imaging library installed?
 try:
-    from PIL import Image
-except ImportError, exp:
-    Image = None
+    import PIL.Image
+except ImportError:
+    try:  # sometimes PIL modules are put in PYTHONPATH's root
+        import Image
+        class PIL(object): pass  # dummy wrapper
+        PIL.Image = Image
+    except ImportError:
+        PIL = None
 
 #
 #  Logging for debugging
@@ -189,6 +194,10 @@ class DocxTranslator(nodes.NodeVisitor):
         self.enum_prefix_style = []
 
         self.field_name = None
+
+        self.image_count = 0
+        self.image_dict = {}
+        self.embedded_file_list = []
 
         self.admonition_body = None
         self.current_field_list = None
@@ -446,7 +455,7 @@ class DocxTranslator(nodes.NodeVisitor):
         '''
            start of a compound (pass a text)
         '''
-        if self.states[-1][0] == 'Contents:':
+        if len(self.states[-1]) >0 and self.states[-1][0] == 'Contents:':
             self.states.pop()
             self.states.append(['  '])
 
@@ -912,18 +921,74 @@ class DocxTranslator(nodes.NodeVisitor):
         # self.end_state()
         #raise nodes.SkipNode
 
+
+    def check_file_exists(self, path):
+        if os.path.exists(path):
+            return 1
+        else:
+            return 0
+
     def visit_image(self, node):
         dprint()
         self.flush_state()
-        dprint(_func=' image ', uri=node.attributes['uri'])
-        uri = node.attributes['uri']
-        file_path = os.path.join(self.builder.env.srcdir, uri)
+        if 'uri' in node.attributes:
+            source = node.attributes['uri']
+            if not source.startswith('http:'):
+                if not source.startswith(os.sep):
+                    docsource, line = utils.get_source_line(node)
+                    if docsource:
+                        dirname = self.builder.env.srcdir
+                        if dirname:
+                            source = '%s%s%s' % (dirname, os.sep, source, )
+                if not self.check_file_exists(source):
+                    self.document.reporter.warning(
+                        'Cannot find image file %s.' % (source, ))
+                    return
+        else:
+            return
+
+        if source in self.image_dict:
+            spec = self.image_dict[source]
+        else:
+            self.image_count += 1
+            filename = os.path.split(source)[1]
+            destination = 'Pictures/1%08x%s' % (self.image_count, filename, )
+            if source.startswith('http:'):
+                try:
+                    imgfile = urllib2.urlopen(source)
+                    content = imgfile.read()
+                    imgfile.close()
+                    imgfile2 = tempfile.NamedTemporaryFile('wb', delete=False)
+                    imgfile2.write(content)
+                    imgfile2.close()
+                    imgfilename = imgfile2.name
+                    source = imgfilename
+                except urllib2.HTTPError, e:
+                    self.document.reporter.warning(
+                        "Can't open image url %s." % (source, ))
+                spec = (source, destination,)
+            else:
+                source = os.path.abspath(source)
+                destination = source
+                spec = (source, destination,)
+
+            self.embedded_file_list.append(spec)
+            self.image_dict[source] = spec
+        filename, destination = spec
+        dprint(_func=' image ', uri=filename)
+        file_path = os.path.join(destination, filename)
         width, height = self.get_image_scaled_width_height(node, file_path)
 
         self.docx.picture(file_path, '', width, height)
 
     def depart_image(self, node):
         dprint()
+
+    def depart_index(self, node):
+        pass
+
+    def depart_substitution_definition(self, node):
+        pass
 
     def get_image_width_height(self, node, attr):
         size = None
@@ -966,23 +1031,15 @@ class DocxTranslator(nodes.NodeVisitor):
 
     def get_image_scaled_width_height(self, node, filename):
         dpi = (72, 72)
-
-        if Image is not None:
-            try:
-                imageobj = Image.open(filename, 'r')
-            except:
-                raise RuntimeError('Fail to open image file: %s' % filename)
-
+        if PIL is not None and filename in self.image_dict:
+            filename, destination = self.image_dict[filename]
+            imageobj = PIL.Image.open(filename, 'r')
             dpi = imageobj.info.get('dpi', dpi)
             # dpi information can be (xdpi, ydpi) or xydpi
-            try:
-                iter(dpi)
-            except:
-                dpi = (dpi, dpi)
+            try: iter(dpi)
+            except: dpi = (dpi, dpi)
         else:
             imageobj = None
-            raise RuntimeError(
-                'image size not fully specified and PIL not installed')
 
         scale = self.get_image_scale(node)
         width = self.get_image_width_height(node, 'width')
@@ -995,26 +1052,11 @@ class DocxTranslator(nodes.NodeVisitor):
         if height is not None and height[1] == '%':
             height = [
                 int(self.docx.styleDocx.document_height * height[0] * 0.00284), 'px']
-
         if width is None or height is None:
             if imageobj is None:
-                raise RuntimeError(
-                    'image size not fully specified and PIL not installed')
-            if width is None:
-                if height is None:
-                    width = [imageobj.size[0], 'px']
-                    height = [imageobj.size[1], 'px']
-                else:
-                    scaled_width = imageobj.size[
-                        0] * height[0] / imageobj.size[1]
-                    width = [scaled_width, 'px']
-            else:
-                if height is None:
-                    scaled_height = imageobj.size[
-                        1] * width[0] / imageobj.size[0]
-                    height = [scaled_height, 'px']
-                else:
-                    height = [imageobj.size[1], 'px']
+                raise RuntimeError('image size not fully specified and PIL not installed')
+            if width is None: width = [imageobj.size[0], 'px']
+            if height is None: height = [imageobj.size[1], 'px']
 
         width[0] *= scale
         height[0] *= scale
@@ -1301,7 +1343,7 @@ class DocxTranslator(nodes.NodeVisitor):
         if self.docx.get_last_paragraph_style() == 'LiteralBlock':
             self.docx.insert_linespace()
         # We should insert highlighter for docx....
-
+        from pprint import pprint as pp
         highlight_args = node.get('highlight_args', {})
 
         def warner(msg):
@@ -1310,12 +1352,16 @@ class DocxTranslator(nodes.NodeVisitor):
         for x in self.states:
             linenos = 1
             if x:
-                highlighted = self.highlighter.highlight_block(
-                    x[0], self.literal_block_lang,  # warn=warner,
-                    linenos=linenos, **highlight_args)
-                result.append([highlighted])
-
-        self.states = result
+                try:
+                    highlighted = self.highlighter.highlight_block(
+                        x[0], self.literal_block_lang,  # warn=warner,
+                        linenos=linenos, **highlight_args)
+                    result.append([highlighted])
+                except:
+                    print ">"*50
+                    pp(x)
+                    print "<"*50
+        self.states = result;
         self.flush_state(_sty='LiteralBlock')
         self.end_state()
 
@@ -1546,14 +1592,19 @@ class DocxTranslator(nodes.NodeVisitor):
         # if 'text' in node.get('format', '').split():
         #    self.body.append(node.astext())
 
-    def visit_graphviz(self, node):
+    def depart_graphviz(self, node):
         dprint()
-        fname, filename = graphviz.render_dot(
-            self, node['code'], node['options'], 'png')
-        self.flush_state()
-        width, height = self.get_image_scaled_width_height(node, filename)
-        self.docx.picture(filename, '', width, height)
-        raise nodes.SkipNode
+        pass
+
+    def visit_graphviz(self, node):
+        pass
+        # dprint()
+        # fname, filename = graphviz.render_dot(
+        #     self, node['code'], node['options'], 'png')
+        # self.flush_state()
+        # width, height = self.get_image_scaled_width_height(node, filename)
+        # self.docx.picture(filename, '', width, height)
+        # raise nodes.SkipNode
 
     def unknown_visit(self, node):
         dprint()
